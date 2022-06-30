@@ -266,6 +266,9 @@ class CameraController extends ValueNotifier<CameraValue> {
   /// The camera identifier with which the controller is associated.
   int get cameraId => _cameraId;
 
+  /// Returns a value of is camera has been disposed
+  bool get isDisposed => _isDisposed;
+
   /// Initializes the camera on the device.
   ///
   /// Throws a [CameraException] if the initialization fails.
