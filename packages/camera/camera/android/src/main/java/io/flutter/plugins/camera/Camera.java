@@ -584,7 +584,7 @@ class Camera
 
     try {
       captureSession.stopRepeating();
-      captureSession.abortCaptures();
+      //captureSession.abortCaptures();
       Log.i(TAG, "sending capture request");
       captureSession.capture(stillBuilder.build(), captureCallback, backgroundHandler);
     } catch (CameraAccessException e) {
@@ -722,7 +722,7 @@ class Camera
         cameraFeatureFactory.createAutoFocusFeature(cameraProperties, false));
     recordingVideo = false;
     try {
-      captureSession.abortCaptures();
+      //captureSession.abortCaptures();
       mediaRecorder.stop();
     } catch (CameraAccessException | IllegalStateException e) {
       // Ignore exceptions and try to continue (changes are camera session already aborted capture).
