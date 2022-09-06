@@ -85,6 +85,7 @@
 /// Videos are written to disk by `videoAdaptor` on an internal queue managed by AVFoundation.
 @property(strong, nonatomic) dispatch_queue_t photoIOQueue;
 @property(assign, nonatomic) UIDeviceOrientation deviceOrientation;
+@property(assign, nonatomic) BOOL isVideoFrameAvailable;
 @end
 
 @implementation FLTCam
@@ -382,21 +383,15 @@ NSString *const errorMethod = @"error";
 - (void)captureOutput:(AVCaptureOutput *)output
     didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
            fromConnection:(AVCaptureConnection *)connection {
-  if (output == _captureVideoOutput) {
+  if (output == _captureVideoOutput && connection.isVideoOrientationSupported) { //specifying condition for video sample
     CVPixelBufferRef newBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
     CFRetain(newBuffer);
-
-    __block CVPixelBufferRef previousPixelBuffer = nil;
-    // Use `dispatch_sync` to avoid unnecessary context switch under common non-contest scenarios;
-    // Under rare contest scenarios, it will not block for too long since the critical section is
-    // quite lightweight.
-    dispatch_sync(self.pixelBufferSynchronizationQueue, ^{
-      // No need weak self because it's dispatch_sync.
-      previousPixelBuffer = self.latestPixelBuffer;
-      self.latestPixelBuffer = newBuffer;
-    });
-    if (previousPixelBuffer) {
-      CFRelease(previousPixelBuffer);
+    CVPixelBufferRef old = _latestPixelBuffer;
+    while (!OSAtomicCompareAndSwapPtrBarrier(old, newBuffer, (void **)&_latestPixelBuffer)) {
+      old = _latestPixelBuffer;
+    }
+    if (old != nil) {
+      CFRelease(old);
     }
     if (_onFrameAvailable) {
       _onFrameAvailable();
@@ -408,11 +403,8 @@ NSString *const errorMethod = @"error";
     return;
   }
   if (_isStreamingImages) {
-    FlutterEventSink eventSink = _imageStreamHandler.eventSink;
-    if (eventSink && (self.streamingPendingFramesCount < self.maxStreamingPendingFramesCount)) {
-      self.streamingPendingFramesCount++;
+    if (_imageStreamHandler.eventSink) {
       CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
-      // Must lock base address before accessing the pixel data
       CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
 
       size_t imageWidth = CVPixelBufferGetWidth(pixelBuffer);
@@ -457,9 +449,6 @@ NSString *const errorMethod = @"error";
 
         [planes addObject:planeBuffer];
       }
-      // Lock the base address before accessing pixel data, and unlock it afterwards.
-      // Done accessing the `pixelBuffer` at this point.
-      CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
 
       NSMutableDictionary *imageBuffer = [NSMutableDictionary dictionary];
       imageBuffer[@"width"] = [NSNumber numberWithUnsignedLong:imageWidth];
@@ -472,9 +461,9 @@ NSString *const errorMethod = @"error";
       imageBuffer[@"sensorExposureTime"] = [NSNumber numberWithInt:nsExposureDuration];
       imageBuffer[@"sensorSensitivity"] = [NSNumber numberWithFloat:[_captureDevice ISO]];
 
-      dispatch_async(dispatch_get_main_queue(), ^{
-        eventSink(imageBuffer);
-      });
+      _imageStreamHandler.eventSink(imageBuffer);
+
+      CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
     }
   }
   if (_isRecording && !_isRecordingPaused) {
@@ -487,12 +476,13 @@ NSString *const errorMethod = @"error";
     CFRetain(sampleBuffer);
     CMTime currentSampleTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
 
-    if (_videoWriter.status != AVAssetWriterStatusWriting) {
+    if (_videoWriter.status != AVAssetWriterStatusWriting && connection.isVideoOrientationSupported) { //specifying condition for video sample
       [_videoWriter startWriting];
       [_videoWriter startSessionAtSourceTime:currentSampleTime];
     }
 
     if (output == _captureVideoOutput) {
+        _isVideoFrameAvailable=true; //making it true
       if (_videoIsDisconnected) {
         _videoIsDisconnected = NO;
 
@@ -512,33 +502,35 @@ NSString *const errorMethod = @"error";
       CMTime nextSampleTime = CMTimeSubtract(_lastVideoSampleTime, _videoTimeOffset);
       [_videoAdaptor appendPixelBuffer:nextBuffer withPresentationTime:nextSampleTime];
     } else {
-      CMTime dur = CMSampleBufferGetDuration(sampleBuffer);
+        if(_isVideoFrameAvailable){
+            CMTime dur = CMSampleBufferGetDuration(sampleBuffer);
 
-      if (dur.value > 0) {
-        currentSampleTime = CMTimeAdd(currentSampleTime, dur);
-      }
+            if (dur.value > 0) {
+              currentSampleTime = CMTimeAdd(currentSampleTime, dur);
+            }
 
-      if (_audioIsDisconnected) {
-        _audioIsDisconnected = NO;
+            if (_audioIsDisconnected) {
+              _audioIsDisconnected = NO;
 
-        if (_audioTimeOffset.value == 0) {
-          _audioTimeOffset = CMTimeSubtract(currentSampleTime, _lastAudioSampleTime);
-        } else {
-          CMTime offset = CMTimeSubtract(currentSampleTime, _lastAudioSampleTime);
-          _audioTimeOffset = CMTimeAdd(_audioTimeOffset, offset);
+              if (_audioTimeOffset.value == 0) {
+                _audioTimeOffset = CMTimeSubtract(currentSampleTime, _lastAudioSampleTime);
+              } else {
+                CMTime offset = CMTimeSubtract(currentSampleTime, _lastAudioSampleTime);
+                _audioTimeOffset = CMTimeAdd(_audioTimeOffset, offset);
+              }
+
+              return;
+            }
+
+            _lastAudioSampleTime = currentSampleTime;
+
+            if (_audioTimeOffset.value != 0) {
+              CFRelease(sampleBuffer);
+              sampleBuffer = [self adjustTime:sampleBuffer by:_audioTimeOffset];
+            }
+
+            [self newAudioSample:sampleBuffer];
         }
-
-        return;
-      }
-
-      _lastAudioSampleTime = currentSampleTime;
-
-      if (_audioTimeOffset.value != 0) {
-        CFRelease(sampleBuffer);
-        sampleBuffer = [self adjustTime:sampleBuffer by:_audioTimeOffset];
-      }
-
-      [self newAudioSample:sampleBuffer];
     }
 
     CFRelease(sampleBuffer);
